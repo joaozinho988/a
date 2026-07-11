@@ -1,1 +1,398 @@
-loader_xeno.lua
+-- Loader com key vinculada a uma instalacao local.
+-- Troque API_BASE pela URL publicada do seu Cloudflare Worker.
+
+local API_BASE = "https://gag2-key-api.joao-gag2.workers.dev"
+local KEY_FILE = "gag2_saved_key.txt"
+local DEVICE_FILE = "gag2_installation_id.txt"
+
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
+
+local ENV = _G
+if type(getgenv) == "function" then
+    local ok, result = pcall(getgenv)
+    if ok and type(result) == "table" then
+        ENV = result
+    end
+end
+
+local function findRequestFunction()
+    local candidates = {
+        ENV.request,
+        ENV.http_request,
+        ENV.httprequest,
+        _G.request,
+        _G.http_request,
+    }
+
+    if type(syn) == "table" then
+        table.insert(candidates, syn.request)
+    end
+
+    for _, candidate in ipairs(candidates) do
+        if type(candidate) == "function" then
+            return candidate
+        end
+    end
+
+    return nil
+end
+
+local requestFunction = findRequestFunction()
+if not requestFunction then
+    error("Este ambiente nao disponibiliza request/http_request")
+end
+
+local function trim(value)
+    return (tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function readLocalFile(path)
+    if type(readfile) ~= "function" then
+        return nil
+    end
+    if type(isfile) == "function" then
+        local fileOk, exists = pcall(isfile, path)
+        if not fileOk or not exists then
+            return nil
+        end
+    end
+    local ok, value = pcall(readfile, path)
+    if ok and type(value) == "string" then
+        return value
+    end
+    return nil
+end
+
+local function writeLocalFile(path, value)
+    if type(writefile) ~= "function" then
+        return false
+    end
+    return pcall(writefile, path, tostring(value))
+end
+
+local function installationId()
+    local existing = trim(readLocalFile(DEVICE_FILE))
+    if #existing >= 20 then
+        return existing
+    end
+
+    local generated = "install:" .. HttpService:GenerateGUID(false)
+    if not writeLocalFile(DEVICE_FILE, generated) then
+        error("writefile e necessario para manter o vinculo deste dispositivo")
+    end
+    return generated
+end
+
+local DEVICE_ID = installationId()
+
+local ERROR_MESSAGES = {
+    invalid_json = "Resposta/requisicao invalida.",
+    invalid_key = "Formato de key invalido.",
+    invalid_device_id = "Identificador da instalacao invalido.",
+    key_not_found = "Key nao encontrada.",
+    key_revoked = "Esta key foi bloqueada.",
+    key_expired = "Esta key expirou.",
+    key_bound_to_another_device = "Esta key ja esta vinculada a outro dispositivo.",
+    invalid_or_expired_token = "Token invalido ou expirado.",
+    device_mismatch = "O token pertence a outro dispositivo.",
+    license_not_valid = "A licenca nao esta mais valida.",
+    payload_not_configured = "O payload ainda nao foi configurado no servidor.",
+    server_not_configured = "A API ainda nao recebeu os secrets obrigatorios.",
+    internal_error = "Erro interno na API.",
+}
+
+local function decodeJson(text)
+    local ok, result = pcall(function()
+        return HttpService:JSONDecode(text)
+    end)
+    if ok and type(result) == "table" then
+        return result
+    end
+    return nil
+end
+
+local function postJson(path, body)
+    local encoded = HttpService:JSONEncode(body)
+    local ok, response = pcall(requestFunction, {
+        Url = API_BASE .. path,
+        Method = "POST",
+        Headers = {
+            ["content-type"] = "application/json",
+            ["accept"] = "application/json, text/plain",
+        },
+        Body = encoded,
+    })
+
+    if not ok then
+        return nil, "Falha HTTP: " .. tostring(response)
+    end
+    if type(response) ~= "table" then
+        return nil, "Resposta HTTP desconhecida"
+    end
+
+    local status = tonumber(response.StatusCode or response.Status or response.status_code) or 0
+    local responseBody = tostring(response.Body or response.body or "")
+    return {
+        status = status,
+        body = responseBody,
+        json = decodeJson(responseBody),
+    }, nil
+end
+
+local function readableApiError(response)
+    local code = response and response.json and response.json.error
+    return ERROR_MESSAGES[code] or tostring(code or (response and response.body) or "Erro desconhecido")
+end
+
+local loading = false
+local gui
+local statusLabel
+local keyBox
+local activateButton
+
+local function setStatus(text, color)
+    if statusLabel then
+        statusLabel.Text = tostring(text)
+        statusLabel.TextColor3 = color or Color3.fromRGB(190, 194, 205)
+    end
+end
+
+local function activate(key)
+    if loading then
+        return false, "Ja existe uma validacao em andamento"
+    end
+    key = trim(key)
+    if key == "" then
+        return false, "Digite sua key"
+    end
+
+    loading = true
+    if activateButton then
+        activateButton.Text = "VALIDANDO..."
+        activateButton.AutoButtonColor = false
+    end
+    setStatus("Validando key...", Color3.fromRGB(245, 190, 92))
+
+    local activation, activationError = postJson("/v1/activate", {
+        key = key,
+        deviceId = DEVICE_ID,
+    })
+
+    if not activation then
+        loading = false
+        if activateButton then
+            activateButton.Text = "ATIVAR"
+            activateButton.AutoButtonColor = true
+        end
+        return false, activationError
+    end
+    if activation.status ~= 200 or not activation.json or activation.json.ok ~= true then
+        loading = false
+        if activateButton then
+            activateButton.Text = "ATIVAR"
+            activateButton.AutoButtonColor = true
+        end
+        return false, readableApiError(activation)
+    end
+
+    setStatus("Baixando payload autorizado...", Color3.fromRGB(245, 190, 92))
+    local payloadResponse, payloadError = postJson("/v1/payload", {
+        token = activation.json.token,
+        deviceId = DEVICE_ID,
+    })
+
+    if not payloadResponse then
+        loading = false
+        return false, payloadError
+    end
+    if payloadResponse.status ~= 200 then
+        loading = false
+        return false, readableApiError(payloadResponse)
+    end
+
+    local compiler = loadstring
+    if type(compiler) ~= "function" then
+        loading = false
+        return false, "loadstring nao esta disponivel"
+    end
+
+    local compileOk, chunk = pcall(compiler, payloadResponse.body)
+    if not compileOk or type(chunk) ~= "function" then
+        loading = false
+        return false, "Payload invalido: " .. tostring(chunk)
+    end
+
+    writeLocalFile(KEY_FILE, key)
+    setStatus("Key aprovada. Iniciando...", Color3.fromRGB(96, 214, 138))
+    task.wait(0.2)
+
+    if gui then
+        gui:Destroy()
+        gui = nil
+    end
+
+    local runOk, runError = pcall(chunk)
+    loading = false
+    if not runOk then
+        warn("[KeyLoader] Erro no payload: " .. tostring(runError))
+        return false, "Erro ao iniciar payload: " .. tostring(runError)
+    end
+
+    return true
+end
+
+local function guiParent()
+    if type(gethui) == "function" then
+        local ok, result = pcall(gethui)
+        if ok and result then
+            return result
+        end
+    end
+    return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local parent = guiParent()
+local previous = parent:FindFirstChild("GAG2KeyLoader")
+if previous then
+    previous:Destroy()
+end
+
+gui = Instance.new("ScreenGui")
+gui.Name = "GAG2KeyLoader"
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 2000
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Global
+gui.Parent = parent
+
+local frame = Instance.new("Frame")
+frame.AnchorPoint = Vector2.new(0.5, 0.5)
+frame.Position = UDim2.fromScale(0.5, 0.5)
+frame.Size = UDim2.fromOffset(360, 220)
+frame.BackgroundColor3 = Color3.fromRGB(24, 26, 33)
+frame.BorderSizePixel = 0
+frame.Parent = gui
+
+local frameCorner = Instance.new("UICorner")
+frameCorner.CornerRadius = UDim.new(0, 12)
+frameCorner.Parent = frame
+
+local frameStroke = Instance.new("UIStroke")
+frameStroke.Color = Color3.fromRGB(58, 62, 78)
+frameStroke.Parent = frame
+
+local title = Instance.new("TextLabel")
+title.BackgroundTransparency = 1
+title.Position = UDim2.fromOffset(16, 10)
+title.Size = UDim2.new(1, -32, 0, 30)
+title.Font = Enum.Font.GothamBold
+title.Text = "GAG2 - Ativacao"
+title.TextColor3 = Color3.fromRGB(235, 238, 245)
+title.TextSize = 17
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = frame
+
+local subtitle = Instance.new("TextLabel")
+subtitle.BackgroundTransparency = 1
+subtitle.Position = UDim2.fromOffset(16, 40)
+subtitle.Size = UDim2.new(1, -32, 0, 30)
+subtitle.Font = Enum.Font.Gotham
+subtitle.Text = "Uma key pode usar qualquer conta neste dispositivo."
+subtitle.TextColor3 = Color3.fromRGB(148, 154, 170)
+subtitle.TextSize = 11
+subtitle.TextXAlignment = Enum.TextXAlignment.Left
+subtitle.Parent = frame
+
+keyBox = Instance.new("TextBox")
+keyBox.BackgroundColor3 = Color3.fromRGB(37, 40, 51)
+keyBox.BorderSizePixel = 0
+keyBox.ClearTextOnFocus = false
+keyBox.Position = UDim2.fromOffset(16, 78)
+keyBox.Size = UDim2.new(1, -32, 0, 38)
+keyBox.Font = Enum.Font.Code
+keyBox.PlaceholderText = "GAG2-XXXXX-XXXXX-XXXXX"
+keyBox.PlaceholderColor3 = Color3.fromRGB(105, 111, 128)
+keyBox.Text = trim(readLocalFile(KEY_FILE))
+keyBox.TextColor3 = Color3.fromRGB(235, 238, 245)
+keyBox.TextSize = 14
+keyBox.TextXAlignment = Enum.TextXAlignment.Left
+keyBox.Parent = frame
+
+local keyCorner = Instance.new("UICorner")
+keyCorner.CornerRadius = UDim.new(0, 7)
+keyCorner.Parent = keyBox
+
+local keyPadding = Instance.new("UIPadding")
+keyPadding.PaddingLeft = UDim.new(0, 10)
+keyPadding.PaddingRight = UDim.new(0, 10)
+keyPadding.Parent = keyBox
+
+activateButton = Instance.new("TextButton")
+activateButton.BackgroundColor3 = Color3.fromRGB(52, 168, 107)
+activateButton.BorderSizePixel = 0
+activateButton.Position = UDim2.fromOffset(16, 128)
+activateButton.Size = UDim2.new(1, -32, 0, 38)
+activateButton.Font = Enum.Font.GothamBold
+activateButton.Text = "ATIVAR"
+activateButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+activateButton.TextSize = 13
+activateButton.Parent = frame
+
+local activateCorner = Instance.new("UICorner")
+activateCorner.CornerRadius = UDim.new(0, 7)
+activateCorner.Parent = activateButton
+
+statusLabel = Instance.new("TextLabel")
+statusLabel.BackgroundTransparency = 1
+statusLabel.Position = UDim2.fromOffset(16, 176)
+statusLabel.Size = UDim2.new(1, -32, 0, 30)
+statusLabel.Font = Enum.Font.Gotham
+statusLabel.Text = "Digite ou cole sua key."
+statusLabel.TextColor3 = Color3.fromRGB(148, 154, 170)
+statusLabel.TextSize = 11
+statusLabel.TextWrapped = true
+statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+statusLabel.TextYAlignment = Enum.TextYAlignment.Top
+statusLabel.Parent = frame
+
+local function beginActivation()
+    task.spawn(function()
+        local ok, message = activate(keyBox.Text)
+        if not ok then
+            setStatus(message, Color3.fromRGB(255, 118, 118))
+            if activateButton then
+                activateButton.Text = "ATIVAR"
+                activateButton.AutoButtonColor = true
+            end
+        end
+    end)
+end
+
+activateButton.MouseButton1Click:Connect(beginActivation)
+
+keyBox.FocusLost:Connect(function(enterPressed)
+    if enterPressed then
+        beginActivation()
+    end
+end)
+
+-- Se ja existe uma key salva, tenta validar automaticamente.
+if trim(keyBox.Text) ~= "" then
+    task.defer(function()
+        local ok, message = activate(keyBox.Text)
+        if not ok then
+            setStatus(message, Color3.fromRGB(255, 118, 118))
+            if activateButton then
+                activateButton.Text = "ATIVAR"
+                activateButton.AutoButtonColor = true
+            end
+        end
+    end)
+end
+
+return {
+    Activate = activate,
+    DeviceId = DEVICE_ID,
+    Gui = gui,
+}
